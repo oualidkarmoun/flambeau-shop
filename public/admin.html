@@ -392,16 +392,40 @@
       });
     }
 
+    var adminCsrfToken = '';
+
+    function ensureAdminSession(password) {
+      return fetch('/api/admin/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: password })
+      }).then(function(response) {
+        return response.json().then(function(data) {
+          if (!response.ok) {
+            throw new Error(data.error || 'Mot de passe admin incorrect');
+          }
+          adminCsrfToken = data.csrfToken || '';
+          return adminCsrfToken;
+        });
+      });
+    }
+
     function saveProduct(product, isEdit) {
       product.action = isEdit ? 'updateProduct' : 'addProduct';
       product.update = isEdit;
 
-      return fetch('/api/products', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(product)
+      var password = product.password;
+      delete product.password;
+
+      return ensureAdminSession(password).then(function(csrfToken) {
+        return fetch('/api/products', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-CSRF-Token': csrfToken
+          },
+          body: JSON.stringify(product)
+        });
       }).then(function(response) {
         return response.json().then(function(data) {
           if (!response.ok) {
