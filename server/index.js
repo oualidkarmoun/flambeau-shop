@@ -825,10 +825,11 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === 'POST' && url.pathname === '/api/products') {
+    if (!requireAdmin(req, res)) return;
     const body = await parseJsonBody(req);
     const product = validateProduct(body);
     const isUpdate = body.action === 'updateProduct' || body._method === 'PUT' || body.update === true;
-    product.password = cleanText(body.password, 120);
+    product.password = config.adminPassword;
     if (isUpdate) {
       product.id = cleanText(body.id, 80);
     }
@@ -866,10 +867,11 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === 'PUT' && url.pathname === '/api/products') {
+    if (!requireAdmin(req, res)) return;
     const body = await parseJsonBody(req);
     const product = validateProduct(body);
     product.id = cleanText(body.id, 80);
-    product.password = cleanText(body.password, 120);
+    product.password = config.adminPassword;
 
     if (!product.id) {
       sendJson(res, 400, {
