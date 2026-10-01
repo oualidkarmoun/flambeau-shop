@@ -967,32 +967,42 @@ function initCart() {
       var codePostal = (document.getElementById('code-postal') || {}).value || '';
       var adresse    = (document.getElementById('adresse')     || {}).value || '';
 
-      var orderNum = 'FLB-' + Date.now().toString(36).toUpperCase();
-      var orderItems = cart.items.map(function(item) {
-        var p = getProductById(item.productId);
-        return { productId: item.productId, name: p ? p.name : 'Produit', fragrance: getItemFragrance(item), price: p ? p.price : 0, qty: item.quantity };
-      });
-      var orderSubtotal = getCartTotal(cart);
-      var orderShipping = getDeliveryFee(ville, orderSubtotal);
-      var orderTotal = orderSubtotal + orderShipping;
+      var randomId = (window.crypto && typeof window.crypto.randomUUID === 'function')
+        ? window.crypto.randomUUID().toUpperCase()
+        : (Date.now().toString(36).toUpperCase() + '-' + Math.random().toString(36).slice(2, 10).toUpperCase());
+      var orderNum = 'FLB-' + randomId;
 
-      // Données complètes de la commande
+      // The client sends only product identity, fragrance and quantity.
+      // Prices, stock, shipping and totals are recalculated server-side.
+      var orderItems = cart.items.map(function(item) {
+        return {
+          productId: item.productId,
+          fragrance: getItemFragrance(item),
+          qty: item.quantity
+        };
+      });
+
+      var displayItems = cart.items.map(function(item) {
+        var p = getProductById(item.productId);
+        return {
+          productId: item.productId,
+          name: p ? p.name : 'Produit',
+          fragrance: getItemFragrance(item),
+          price: p ? p.price : 0,
+          qty: item.quantity
+        };
+      });
+
       var orderData = {
         action: 'order',
         orderNum: orderNum,
-        date: new Date().toLocaleString('fr-FR'),
         nom: nom,
         prenom: prenom,
         telephone: numero,
         ville: ville,
         codePostal: codePostal,
         adresse: adresse,
-        items: orderItems,
-        subtotal: orderSubtotal,
-        livraison: orderShipping,
-        delivery: orderShipping,
-        shipping: orderShipping,
-        total: orderTotal
+        items: orderItems
       };
 
       var submitBtn = form.querySelector('.cart-page__checkout-btn');
@@ -1006,9 +1016,24 @@ function initCart() {
         if (result && result.orderNum) {
           orderNum = result.orderNum;
         }
-        try { sessionStorage.setItem('flambeau_last_order', JSON.stringify({ items: orderItems, total: orderTotal })); } catch(e){}
+
+        var canonicalOrder = result && result.order ? result.order : {};
+        var confirmedItems = Array.isArray(canonicalOrder.items) && canonicalOrder.items.length
+          ? canonicalOrder.items
+          : displayItems;
+        var confirmedTotal = Number.isFinite(Number(canonicalOrder.total))
+          ? Number(canonicalOrder.total)
+          : getCartTotal(cart) + getDeliveryFee(ville, getCartTotal(cart));
+
+        try {
+          sessionStorage.setItem('flambeau_last_order', JSON.stringify({
+            items: confirmedItems,
+            total: confirmedTotal
+          }));
+        } catch(e){}
+
         clearCart(); renderCartDrawer();
-        window.location.href = 'confirmation.html?order=' + orderNum;
+        window.location.href = 'confirmation.html?order=' + encodeURIComponent(orderNum);
       }).catch(function(error) {
         if (submitBtn) {
           submitBtn.disabled = false;
