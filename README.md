@@ -21,10 +21,9 @@ The project combines an elegant storefront, product and order workflows, a real 
 ## ✨ Preview
 
 <p align="center">
-  <img src="docs/Capture d’écran 2026-09-30 213325.png" width="100%" alt="FLAMBEAU Shop homepage preview" />
+  <img src="docs/flambeau-home.png" width="100%" alt="FLAMBEAU Shop homepage preview" />
 </p>
 
-> Add the provided homepage screenshot as `docs/Capture d’écran 2026-09-30 213325.png` to display it here.
 
 ---
 
