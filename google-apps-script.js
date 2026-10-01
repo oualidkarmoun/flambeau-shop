@@ -3,9 +3,9 @@
 // Produits + commandes Google Sheets + emails
 // ============================================================
 
-var DEFAULT_SHEET_ID = '1SI8I4j0FSsUJKd44pHApttKW9F2wCp3jXNviBuJfQ8c';
+var DEFAULT_SHEET_ID = '';
 var NOTIF_EMAIL = 'flambeaushop@gmail.com';
-var DEFAULT_ADMIN_PASSWORD = 'FlambeauAdmin2026!';
+var DEFAULT_ADMIN_PASSWORD = '';
 var TIMEZONE = 'Africa/Casablanca';
 var MAX_ORDER_ITEMS = 50;
 
@@ -161,7 +161,9 @@ function getConfiguredSheetIdSource() {
 }
 
 function getAdminPassword() {
-  return cleanText(getScriptProperty('ADMIN_PASSWORD') || DEFAULT_ADMIN_PASSWORD, 120);
+  var password = cleanText(getScriptProperty('ADMIN_PASSWORD') || DEFAULT_ADMIN_PASSWORD, 120);
+  if (!password) throw new Error('ADMIN_PASSWORD non configure dans Script Properties');
+  return password;
 }
 
 function getScriptProperty(name) {
@@ -284,8 +286,9 @@ function formatOrdersSheet(sheet) {
 // -------------------- Produits --------------------
 
 function getProductsPayload() {
-  var ss = setupSheets();
+  var ss = getSpreadsheet();
   var sheet = ss.getSheetByName('Produits');
+  if (!sheet) throw new Error('Feuille Produits introuvable. Executez setupSheets une fois.');
   var rows = sheet.getDataRange().getValues();
   var products = [];
 
@@ -330,7 +333,6 @@ function addProduct(data) {
   }
 
   sheet.appendRow(buildProductRow(id, product));
-  formatProductsSheet(sheet);
   return { status: 'ok', type: 'product', id: id, created: true };
 }
 
@@ -351,7 +353,6 @@ function updateProduct(data) {
   }
 
   sheet.appendRow(buildProductRow(id, product));
-  formatProductsSheet(sheet);
   return { status: 'ok', type: 'product', id: id, created: true };
 }
 
@@ -398,7 +399,6 @@ function buildProductRow(id, product) {
 function writeProductRow(sheet, rowNumber, id, product) {
   sheet.getRange(rowNumber, 1, 1, PRODUCT_HEADERS.length)
     .setValues([buildProductRow(id, product)]);
-  formatProductsSheet(sheet);
 }
 
 function findProductRow(sheet, id, name, category) {
@@ -422,17 +422,145 @@ function findProductRow(sheet, id, name, category) {
 // -------------------- Commandes --------------------
 
 function handleOrder(order) {
-  var ss = setupSheets();
-  var sheet = ss.getSheetByName('Commandes');
-  var cleanOrder = validateOrder(order);
-  var lock = LockService.getScriptLock();
+  var ss = getSpreadsheet();
+  var ordersSheet = ss.getSheetByName('Commandes');
+  var productsSheet = ss.getSheetByName('Produits');
 
-  lock.waitLock(10000);
+  if (!ordersSheet || !productsSheet) {
+    throw new Error('Feuilles Produits/Commandes introuvables. Executez setupSheets une fois.');
+  }
+
+  var request = validateOrderRequest(order);
+  var lock = LockService.getScriptLock();
+  var cleanOrder;
+  var previousStocks = [];
+
+  lock.waitLock(30000);
   try {
-    sheet.appendRow(buildOrderRow(cleanOrder));
-    var lastRow = sheet.getLastRow();
-    sheet.getRange(lastRow, 10, 1, 2).setWrap(true);
-    formatOrdersSheet(sheet);
+    var duplicate = findExistingOrder(ordersSheet, request.orderNum);
+    if (duplicate) {
+      return {
+        status: 'ok',
+        type: 'order',
+        duplicate: true,
+        orderNum: request.orderNum,
+        subtotal: duplicate.subtotal,
+        livraison: duplicate.livraison,
+        total: duplicate.total,
+        items: []
+      };
+    }
+
+    var productRows = productsSheet.getDataRange().getValues();
+    var resolvedItems = request.items.map(function(item) {
+      var foundIndex = -1;
+      for (var i = 1; i < productRows.length; i += 1) {
+        if (normalizeKey(productRows[i][0]) === normalizeKey(item.productId)) {
+          foundIndex = i;
+          break;
+        }
+      }
+
+      if (foundIndex === -1) {
+        throw new Error('Produit introuvable: ' + item.productId);
+      }
+
+      var row = productRows[foundIndex];
+      var name = cleanText(row[1], 160) || 'Produit';
+      var price = cleanNumber(row[4], 0, 100000);
+      var stock = Math.floor(cleanNumber(row[9], 0, 100000));
+      var inStock = row[11] === false ? false : String(row[11]).toUpperCase() !== 'FALSE';
+      var fragrances = splitList(row[7]);
+      var fragrance = cleanText(item.fragrance, 160);
+
+      if (!inStock || stock < item.qty) {
+        throw new Error('Stock insuffisant pour ' + name + ' (disponible: ' + stock + ')');
+      }
+
+      if (fragrances.length > 0) {
+        if (!fragrance) {
+          throw new Error('Veuillez choisir un parfum pour ' + name);
+        }
+        var allowed = fragrances.some(function(value) {
+          return normalizeKey(value) === normalizeKey(fragrance);
+        });
+        if (!allowed) {
+          throw new Error('Parfum invalide pour ' + name);
+        }
+      }
+
+      return {
+        productId: cleanText(row[0], 80),
+        productRow: foundIndex + 1,
+        name: name,
+        fragrance: fragrance,
+        qty: item.qty,
+        price: price,
+        total: price * item.qty,
+        previousStock: stock,
+        previousInStock: inStock
+      };
+    });
+
+    var subtotal = resolvedItems.reduce(function(sum, item) {
+      return sum + item.total;
+    }, 0);
+    var livraison = getDeliveryFee(request.ville, subtotal);
+
+    cleanOrder = {
+      orderNum: request.orderNum,
+      date: request.date,
+      heure: request.heure,
+      status: 'Nouvelle',
+      prenom: request.prenom,
+      nom: request.nom,
+      telephone: request.telephone,
+      ville: request.ville,
+      adresse: request.adresse,
+      notes: request.notes,
+      items: resolvedItems.map(function(item) {
+        return {
+          productId: item.productId,
+          name: item.name,
+          fragrance: item.fragrance,
+          qty: item.qty,
+          price: item.price,
+          total: item.total
+        };
+      }),
+      quantityTotal: resolvedItems.reduce(function(sum, item) {
+        return sum + item.qty;
+      }, 0),
+      subtotal: subtotal,
+      livraison: livraison,
+      total: subtotal + livraison
+    };
+
+    cleanOrder.articles = formatOrderArticles(cleanOrder.items);
+    cleanOrder.parfums = formatOrderFragrances(cleanOrder.items);
+
+    resolvedItems.forEach(function(item) {
+      var newStock = item.previousStock - item.qty;
+      previousStocks.push({
+        row: item.productRow,
+        stock: item.previousStock,
+        inStock: item.previousInStock
+      });
+      productsSheet.getRange(item.productRow, 10).setValue(newStock);
+      productsSheet.getRange(item.productRow, 12).setValue(newStock > 0);
+    });
+
+    try {
+      ordersSheet.appendRow(buildOrderRow(cleanOrder));
+      var lastRow = ordersSheet.getLastRow();
+      ordersSheet.getRange(lastRow, 10, 1, 2).setWrap(true);
+    } catch (writeError) {
+      previousStocks.forEach(function(previous) {
+        productsSheet.getRange(previous.row, 10).setValue(previous.stock);
+        productsSheet.getRange(previous.row, 12).setValue(previous.inStock);
+      });
+      throw writeError;
+    }
   } finally {
     lock.releaseLock();
   }
@@ -449,66 +577,76 @@ function handleOrder(order) {
   return {
     status: 'ok',
     type: 'order',
+    duplicate: false,
     orderNum: cleanOrder.orderNum,
     sheet: 'saved',
-    email: emailStatus
+    email: emailStatus,
+    items: cleanOrder.items,
+    subtotal: cleanOrder.subtotal,
+    livraison: cleanOrder.livraison,
+    total: cleanOrder.total
   };
 }
 
-function validateOrder(order) {
+function findExistingOrder(sheet, orderNum) {
+  var target = normalizeKey(orderNum);
+  if (!target || sheet.getLastRow() < 2) return null;
+
+  var values = sheet.getRange(2, 1, sheet.getLastRow() - 1, ORDER_HEADERS.length).getValues();
+  for (var i = 0; i < values.length; i += 1) {
+    if (normalizeKey(values[i][0]) === target) {
+      return {
+        subtotal: cleanNumber(values[i][12], 0, 1000000),
+        livraison: cleanNumber(values[i][13], 0, 1000000),
+        total: cleanNumber(values[i][14], 0, 1000000)
+      };
+    }
+  }
+  return null;
+}
+
+function validateOrderRequest(order) {
   if (!order || !Array.isArray(order.items) || order.items.length === 0) {
     throw new Error('Commande vide');
   }
 
   var now = new Date();
+  var orderNum = cleanText(order.orderNum || order.idempotencyKey, 100);
+  var prenom = cleanText(order.prenom || order.firstName, 120);
+  var nom = cleanText(order.nom || order.lastName, 120);
+  var telephone = cleanText(order.telephone || order.phone, 60);
+  var ville = cleanText(order.ville || order.city, 120);
+  var adresse = cleanText(order.adresse || order.address, 260);
+
+  if (!orderNum) throw new Error('Identifiant de commande manquant');
+  if (prenom.length < 2) throw new Error('Prenom obligatoire');
+  if (nom.length < 2) throw new Error('Nom obligatoire');
+  if (!/^[+0-9 ()-]{8,20}$/.test(telephone)) throw new Error('Telephone invalide');
+  if (ville.length < 2) throw new Error('Ville obligatoire');
+  if (adresse.length < 5) throw new Error('Adresse obligatoire');
+
   var items = order.items.slice(0, MAX_ORDER_ITEMS).map(function(item) {
-    var qty = cleanNumber(item.qty || item.quantity, 1, 1000);
-    var price = cleanNumber(item.price || item.prix, 0, 100000);
+    var productId = cleanText(item.productId, 80);
+    var qty = Math.floor(cleanNumber(item.qty || item.quantity, 1, 100));
+    if (!productId) throw new Error('ID produit manquant');
     return {
-      name: cleanText(item.name || item.nom, 160) || 'Produit',
+      productId: productId,
       fragrance: cleanText(item.fragrance || item.parfum, 160),
-      qty: qty,
-      price: price,
-      total: qty * price
+      qty: qty
     };
   });
 
-  var quantityTotal = items.reduce(function(sum, item) {
-    return sum + item.qty;
-  }, 0);
-
-  var subtotal = order.subtotal != null
-    ? cleanNumber(order.subtotal, 0, 1000000)
-    : items.reduce(function(sum, item) {
-        return sum + item.total;
-      }, 0);
-
-  var livraison = order.livraison != null
-    ? cleanNumber(order.livraison, 0, 1000000)
-    : getDeliveryFee(order.ville || order.city, subtotal);
-
-  var total = order.total != null
-    ? cleanNumber(order.total, 0, 1000000)
-    : subtotal + livraison;
-
   return {
-    orderNum: cleanText(order.orderNum, 80) || ('FLB-' + Date.now()),
+    orderNum: orderNum,
     date: Utilities.formatDate(now, TIMEZONE, 'dd/MM/yyyy'),
     heure: Utilities.formatDate(now, TIMEZONE, 'HH:mm'),
-    status: cleanText(order.status || order.statut, 80) || 'Nouvelle',
-    prenom: cleanText(order.prenom || order.firstName, 120),
-    nom: cleanText(order.nom || order.lastName, 120),
-    telephone: cleanText(order.telephone || order.phone, 60),
-    ville: cleanText(order.ville || order.city, 120),
-    adresse: cleanText(order.adresse || order.address, 260),
+    prenom: prenom,
+    nom: nom,
+    telephone: telephone,
+    ville: ville,
+    adresse: adresse,
     notes: cleanText(order.notes || order.note || order.commentaire, 400),
-    items: items,
-    articles: formatOrderArticles(items),
-    parfums: formatOrderFragrances(items),
-    quantityTotal: quantityTotal,
-    subtotal: subtotal,
-    livraison: livraison,
-    total: total
+    items: items
   };
 }
 
