@@ -21,10 +21,11 @@ const config = {
   sessionSecret: process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex'),
   googleAppsScriptUrl: process.env.GOOGLE_APPS_SCRIPT_URL || '',
   corsAllowedOrigins: parseList(process.env.CORS_ALLOWED_ORIGINS || ''),
-  trustProxy: String(process.env.TRUST_PROXY || '').toLowerCase() === 'true'
+  trustProxy: String(process.env.TRUST_PROXY || '').toLowerCase() === 'true',
+  upstashRedisRestUrl: String(process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/$/, ''),
+  upstashRedisRestToken: process.env.UPSTASH_REDIS_REST_TOKEN || ''
 };
 
-const sessions = new Map();
 const rateBuckets = new Map();
 const ONE_HOUR = 60 * 60 * 1000;
 const PRODUCTS_FETCH_TIMEOUT_MS = 6500;
@@ -150,6 +151,20 @@ function sendJson(res, status, payload, headers = {}) {
 function sendError(res, status, message) {
   sendJson(res, status, { error: message });
 }
+
+function logEvent(level, event, details = {}) {
+  const payload = {
+    ts: new Date().toISOString(),
+    level,
+    event,
+    ...details
+  };
+  const line = JSON.stringify(payload);
+  if (level === 'error') console.error(line);
+  else if (level === 'warn') console.warn(line);
+  else console.log(line);
+}
+
 
 async function parseJsonBody(req, maxBytes = 1024 * 1024) {
   const contentType = String(req.headers['content-type'] || '').toLowerCase();
@@ -286,38 +301,61 @@ function validateProduct(input) {
 }
 
 function validateOrder(input) {
-  if (!Array.isArray(input.items) || input.items.length === 0) {
+  if (!input || !Array.isArray(input.items) || input.items.length === 0) {
     throw Object.assign(new Error('Order is empty'), { statusCode: 400 });
   }
 
-  const items = input.items.slice(0, 50).map((item) => ({
-    productId: cleanText(item.productId, 80),
-    name: cleanText(item.name, 120) || 'Produit',
-    fragrance: cleanText(item.fragrance || item.parfum, 120),
-    price: cleanNumber(item.price, 0, 100000),
-    qty: cleanNumber(item.qty || item.quantity, 1, 1000)
-  }));
+  const items = input.items.slice(0, 50).map((item) => {
+    const productId = cleanText(item.productId, 80);
+    const qty = Math.floor(cleanNumber(item.qty || item.quantity, 1, 100));
+    if (!productId) {
+      throw Object.assign(new Error('Product id is required'), { statusCode: 400 });
+    }
+    return {
+      productId,
+      fragrance: cleanText(item.fragrance || item.parfum, 120),
+      qty
+    };
+  });
 
-  const subtotal = items.reduce((sum, item) => sum + item.price * item.qty, 0);
+  const firstName = cleanText(input.prenom || input.firstName, 120);
+  const lastName = cleanText(input.nom || input.lastName, 120);
+  const phone = cleanText(input.telephone || input.phone, 40);
   const city = cleanText(input.ville || input.city, 120);
-  const shipping = getDeliveryFee(city, subtotal);
+  const address = cleanText(input.adresse || input.address, 250);
+
+  if (firstName.length < 2) {
+    throw Object.assign(new Error('Prenom is required'), { statusCode: 400 });
+  }
+  if (lastName.length < 2) {
+    throw Object.assign(new Error('Nom is required'), { statusCode: 400 });
+  }
+  if (!/^[+0-9 ()-]{8,20}$/.test(phone)) {
+    throw Object.assign(new Error('Telephone invalide'), { statusCode: 400 });
+  }
+  if (city.length < 2) {
+    throw Object.assign(new Error('Ville is required'), { statusCode: 400 });
+  }
+  if (address.length < 5) {
+    throw Object.assign(new Error('Adresse is required'), { statusCode: 400 });
+  }
+
+  const suppliedOrderNum = cleanText(input.orderNum || input.idempotencyKey, 100);
+  const orderNum = suppliedOrderNum || `FLB-${crypto.randomUUID().toUpperCase()}`;
 
   return {
-    id: `ORD-${Date.now().toString(36).toUpperCase()}`,
-    orderNum: cleanText(input.orderNum, 80) || `FLB-${Date.now().toString(36).toUpperCase()}`,
+    id: `ORD-${crypto.randomUUID()}`,
+    orderNum,
     date: new Date().toISOString(),
     customer: {
-      firstName: cleanText(input.prenom || input.firstName, 120),
-      lastName: cleanText(input.nom || input.lastName, 120),
-      phone: cleanText(input.telephone || input.phone, 40),
+      firstName,
+      lastName,
+      phone,
       city,
       postalCode: cleanText(input.codePostal || input.postalCode, 40),
-      address: cleanText(input.adresse || input.address, 250)
+      address
     },
     items,
-    subtotal,
-    livraison: shipping,
-    total: subtotal + shipping,
     status: 'new'
   };
 }
@@ -376,11 +414,19 @@ function parseCookies(req) {
   }, {});
 }
 
+function safeEqualText(a, b) {
+  const left = Buffer.from(String(a || ''));
+  const right = Buffer.from(String(b || ''));
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
 function createSession(res) {
-  const id = crypto.randomBytes(24).toString('base64url');
   const csrfToken = crypto.randomBytes(24).toString('base64url');
-  sessions.set(id, { csrfToken, createdAt: Date.now() });
-  const cookie = `${id}.${sign(id)}`;
+  const payload = Buffer.from(JSON.stringify({
+    csrfToken,
+    exp: Date.now() + (2 * ONE_HOUR)
+  })).toString('base64url');
+  const cookie = `${payload}.${sign(payload)}`;
   const secure = config.nodeEnv === 'production' ? '; Secure' : '';
   res.setHeader('Set-Cookie', `flambeau_admin=${encodeURIComponent(cookie)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=7200${secure}`);
   return { csrfToken };
@@ -389,15 +435,20 @@ function createSession(res) {
 function getSession(req) {
   const cookie = parseCookies(req).flambeau_admin;
   if (!cookie) return null;
-  const [id, signature] = cookie.split('.');
-  if (!id || signature !== sign(id)) return null;
-  const session = sessions.get(id);
-  if (!session) return null;
-  if (Date.now() - session.createdAt > 2 * 60 * 60 * 1000) {
-    sessions.delete(id);
+  const separator = cookie.lastIndexOf('.');
+  if (separator <= 0) return null;
+
+  const payload = cookie.slice(0, separator);
+  const signature = cookie.slice(separator + 1);
+  if (!safeEqualText(signature, sign(payload))) return null;
+
+  try {
+    const session = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    if (!session.csrfToken || !session.exp || Date.now() > Number(session.exp)) return null;
+    return session;
+  } catch (_) {
     return null;
   }
-  return { id, ...session };
 }
 
 function requireAdmin(req, res) {
@@ -415,26 +466,65 @@ function requireAdmin(req, res) {
   return session;
 }
 
-function applyRateLimit(req, res) {
-  const forwardedFor = config.trustProxy ? String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() : '';
-  const ip = forwardedFor || req.socket.remoteAddress || 'unknown';
-  const key = `${ip}:${req.url.split('?')[0]}`;
-  const now = Date.now();
-  const bucket = rateBuckets.get(key) || { count: 0, resetAt: now + 60_000 };
+async function incrementSharedRateLimit(key, windowSeconds) {
+  if (!config.upstashRedisRestUrl || !config.upstashRedisRestToken) return null;
 
-  if (now > bucket.resetAt) {
-    bucket.count = 0;
-    bucket.resetAt = now + 60_000;
+  const response = await fetch(config.upstashRedisRestUrl + '/pipeline', {
+    method: 'POST',
+    headers: {
+      Authorization: 'Bearer ' + config.upstashRedisRestToken,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify([
+      ['INCR', key],
+      ['EXPIRE', key, windowSeconds, 'NX']
+    ])
+  });
+
+  if (!response.ok) {
+    throw new Error('Shared rate limiter unavailable');
   }
 
-  bucket.count += 1;
-  rateBuckets.set(key, bucket);
+  const data = await response.json();
+  return Number(data && data[0] && data[0].result);
+}
+
+async function applyRateLimit(req, res) {
+  const forwardedFor = config.trustProxy ? String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() : '';
+  const ip = forwardedFor || req.socket?.remoteAddress || 'unknown';
+  const route = req.url.split('?')[0];
 
   let limit = 120;
-  if (req.url.startsWith('/api/admin/login')) limit = 8;
-  else if (req.url.startsWith('/api/admin')) limit = 30;
-  else if (req.method === 'POST' && req.url.startsWith('/api/contact')) limit = 10;
-  else if (req.method === 'POST' && req.url.startsWith('/api/orders')) limit = 20;
+  if (route.startsWith('/api/admin/login')) limit = 8;
+  else if (route.startsWith('/api/admin')) limit = 30;
+  else if (req.method === 'POST' && route.startsWith('/api/contact')) limit = 10;
+  else if (req.method === 'POST' && route.startsWith('/api/orders')) limit = 20;
+
+  const windowMs = 60_000;
+  const now = Date.now();
+  const key = `flambeau:rl:${ip}:${route}`;
+
+  try {
+    const sharedCount = await incrementSharedRateLimit(key, 60);
+    if (sharedCount != null) {
+      if (sharedCount > limit) {
+        res.setHeader('Retry-After', '60');
+        sendError(res, 429, 'Too many requests');
+        return false;
+      }
+      return true;
+    }
+  } catch (error) {
+    logEvent('warn', 'rate_limit_shared_fallback', { message: error.message });
+  }
+
+  const bucket = rateBuckets.get(key) || { count: 0, resetAt: now + windowMs };
+  if (now > bucket.resetAt) {
+    bucket.count = 0;
+    bucket.resetAt = now + windowMs;
+  }
+  bucket.count += 1;
+  rateBuckets.set(key, bucket);
 
   if (bucket.count > limit) {
     res.setHeader('Retry-After', Math.max(1, Math.ceil((bucket.resetAt - now) / 1000)));
@@ -449,13 +539,6 @@ function cleanupRateBuckets() {
   const now = Date.now();
   for (const [key, bucket] of rateBuckets.entries()) {
     if (now > bucket.resetAt + 60_000) rateBuckets.delete(key);
-  }
-}
-
-function cleanupSessions() {
-  const now = Date.now();
-  for (const [id, session] of sessions.entries()) {
-    if (now - session.createdAt > 2 * ONE_HOUR) sessions.delete(id);
   }
 }
 
@@ -528,10 +611,11 @@ async function sendOrderToAppsScript(order) {
     ville: order.customer.city,
     codePostal: order.customer.postalCode,
     adresse: order.customer.address,
-    items: order.items,
-    subtotal: order.subtotal,
-    livraison: order.livraison,
-    total: order.total
+    items: order.items.map((item) => ({
+      productId: item.productId,
+      fragrance: item.fragrance,
+      qty: item.qty
+    }))
   };
 
   const response = await fetch(config.googleAppsScriptUrl, {
@@ -698,7 +782,7 @@ async function sendContactToAppsScript(contact) {
 }
 
 async function handleApi(req, res, url) {
-  if (!applyRateLimit(req, res)) return;
+  if (!(await applyRateLimit(req, res))) return;
 
   if (req.method === 'OPTIONS') {
     res.writeHead(204, securityHeaders({
@@ -866,33 +950,47 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === 'POST' && url.pathname === '/api/orders') {
-    const order = validateOrder(await parseJsonBody(req));
-    const orders = await readJsonArray(ORDERS_FILE);
-    orders.push(order);
-    await writeJson(ORDERS_FILE, orders);
+    const order = validateOrder(await parseJsonBody(req, 128 * 1024));
 
     try {
       const integration = await sendOrderToAppsScript(order);
 
       if (integration && integration.status === 'skipped') {
-        console.warn('Order Google integration skipped:', integration.reason);
+        logEvent('error', 'order_persistence_unconfigured', { orderNum: order.orderNum });
         sendJson(res, 503, {
           ok: false,
           orderNum: order.orderNum,
-          error: 'Order saved locally, but Google integration is not configured',
+          error: 'Order persistence is not configured',
           details: integration.reason
         });
         return;
       }
 
-      sendJson(res, 201, { ok: true, orderNum: order.orderNum, integration });
+      const canonical = integration && integration.response ? integration.response : {};
+      logEvent('info', canonical.duplicate ? 'order_duplicate' : 'order_created', {
+        orderNum: canonical.orderNum || order.orderNum,
+        total: canonical.total,
+        itemCount: Array.isArray(canonical.items) ? canonical.items.length : order.items.length
+      });
+
+      sendJson(res, canonical.duplicate ? 200 : 201, {
+        ok: true,
+        orderNum: canonical.orderNum || order.orderNum,
+        duplicate: Boolean(canonical.duplicate),
+        order: {
+          items: canonical.items || [],
+          subtotal: canonical.subtotal,
+          livraison: canonical.livraison,
+          total: canonical.total
+        }
+      });
       return;
     } catch (error) {
-      console.warn('Order Google integration failed:', error.message);
+      logEvent('error', 'order_failed', { orderNum: order.orderNum, message: error.message });
       sendJson(res, 502, {
         ok: false,
         orderNum: order.orderNum,
-        error: 'Order saved locally, but Google Sheet or email failed',
+        error: 'Order could not be completed',
         details: error.message
       });
       return;
@@ -939,8 +1037,6 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === 'POST' && url.pathname === '/api/admin/logout') {
-    const session = getSession(req);
-    if (session) sessions.delete(session.id);
     res.setHeader('Set-Cookie', 'flambeau_admin=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');
     sendJson(res, 200, { ok: true });
     return;
@@ -994,7 +1090,22 @@ async function serveStatic(req, res, url) {
 }
 
 async function requestHandler(req, res) {
+  const requestId = crypto.randomUUID();
+  const startedAt = Date.now();
   try {
+    if (typeof res.setHeader === 'function') res.setHeader('X-Request-Id', requestId);
+    if (typeof res.on === 'function') {
+      res.on('finish', () => {
+        logEvent('info', 'http_request', {
+          requestId,
+          method: req.method,
+          path: String(req.url || '').split('?')[0],
+          status: res.statusCode,
+          durationMs: Date.now() - startedAt
+        });
+      });
+    }
+
     if (typeof req.setTimeout === 'function') {
       req.setTimeout(15_000);
     }
@@ -1011,14 +1122,17 @@ async function requestHandler(req, res) {
 
     await serveStatic(req, res, url);
   } catch (error) {
-    console.error(error);
+    logEvent('error', 'request_failed', {
+      requestId,
+      message: error.message,
+      stack: config.nodeEnv === 'production' ? undefined : error.stack
+    });
     sendError(res, error.statusCode || 500, error.message || 'Internal server error');
   }
 }
 
 validateRuntimeConfig();
 setInterval(cleanupRateBuckets, 60_000).unref();
-setInterval(cleanupSessions, ONE_HOUR).unref();
 
 if (require.main === module) {
   const server = http.createServer(requestHandler);
@@ -1045,3 +1159,4 @@ if (require.main === module) {
 }
 
 module.exports = requestHandler;
+module.exports._test = { validateOrder, getDeliveryFee, normalizeCityName };
