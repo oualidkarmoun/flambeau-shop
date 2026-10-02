@@ -58,10 +58,6 @@
       "dest": "/api/chat.js"
     },
     {
-      "src": "/api/products",
-      "dest": "/api/products.js"
-    },
-    {
       "src": "/api/(.*)",
       "dest": "/api/[...path].js"
     },
